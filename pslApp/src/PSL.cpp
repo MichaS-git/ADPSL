@@ -37,7 +37,7 @@
 using namespace std;
 
 // Messages to/from server.  Needs to be big enough for binary reads of images that seem to come in 2048 blocks
-#define MAX_MESSAGE_SIZE 4096
+#define MAX_MESSAGE_SIZE 12117512
 #define MAX_FILENAME_LEN 256
 #define PSL_SERVER_TIMEOUT 2.0
 #define PSL_GET_IMAGE_TIMEOUT 20.0
@@ -109,6 +109,7 @@ private:
     choice_t recordFormatChoices_;
     int nCameras_;
     double waitForExposure_;
+    bool lostConnection_ = false;
 };
 #define NUM_PSL_PARAMS ((int)(&LAST_PSL_PARAM - &FIRST_PSL_PARAM + 1))
 
@@ -323,6 +324,19 @@ asynStatus PSL::writeReadServer(const char *output, char *input, size_t maxChars
     status = pasynOctetSyncIO->writeRead(pasynUser, output, strlen(output),
                                          input, maxChars, timeout,
                                          &nWrite_, &nRead_, &eomReason);
+    if (output == "GetImage")
+    {
+        if (nRead_ != maxChars)
+        {
+            cout << maxChars << " maxChars\n";
+            cout << nRead_ << " nRead\n";
+            lostConnection_ = true;
+        }
+        else
+        {
+            lostConnection_ = false;
+        }
+    }
 
     if (status) asynPrint(pasynUser, ASYN_TRACE_ERROR,
                               "%s:%s, status=%d, sent\n%s\n",
@@ -564,7 +578,7 @@ asynStatus PSL::getImage()
     int nDims;
     int itemp1, itemp2;
     int imageCounter;
-    int dataLen;
+    int dataLen=0;
     int nCopied;
     int eomReason;
     int maxRead;
@@ -581,7 +595,18 @@ asynStatus PSL::getImage()
     char *pIn;
     const char *functionName = "getImage";
 
-    writeReadServer("GetImage", PSL_GET_IMAGE_TIMEOUT);
+    if (lostConnection_)
+    {
+        while (lostConnection_)
+        {
+            writeReadServer("GetImage", PSL_GET_IMAGE_TIMEOUT);
+        }
+    }
+    else
+    {
+        writeReadServer("GetImage", PSL_GET_IMAGE_TIMEOUT);
+    }
+
     nDims = 2;
     colorMode = NDColorModeMono;
     if (strncmp(fromServer_, "L;", 2) == 0)
@@ -611,8 +636,14 @@ asynStatus PSL::getImage()
         nDims = 3;
         colorMode = NDColorModeRGB1;
     }
-    setIntegerParam(NDDataType, dataType);
+
+    //cout << fromServer_ << " fromServer_\n";
     sscanf(fromServer_+prefixLen, "%d;%d;%d;%n", &itemp1, &itemp2, &dataLen, &sizeLen);
+    //cout << dataLen << " dataLen\n";
+    //cout << nRead_ << " nRead\n";
+
+    setIntegerParam(NDDataType, dataType);
+
     if (nDims == 2)
     {
         dims[0] = itemp1;
@@ -640,12 +671,22 @@ asynStatus PSL::getImage()
     pIn = fromServer_ + headerLen;
     pOut = (char *)pImage->pData;
     nRead_ -= headerLen;
+    //nRead_ = dataLen;
+
     for (nCopied=0; nCopied<dataLen; nCopied+=(int)nRead_)
     {
+        //cout << nCopied << " nCopied\n";
         if (nCopied > 0)
         {
+            //if (nCopied > nRead_) break;
+
             maxRead = sizeof(fromServer_);
+            //cout << maxRead << " maxRead\n";
             if (maxRead > (dataLen - nCopied)) maxRead = dataLen - nCopied;
+            //cout << maxRead << " maxRead\n";
+            //cout << nRead_ << " nRead_\n";
+            //cout << nCopied << " nCopied\n";
+            //epicsThreadSleep(0.05);
             status = pasynOctetSyncIO->read(pasynUserServer_, fromServer_, maxRead, 1,
                                             &nRead_, &eomReason);
             if (status != asynSuccess)
@@ -661,6 +702,7 @@ asynStatus PSL::getImage()
         memcpy(pOut, pIn, nRead_);
         pOut+= nRead_;
     }
+
     asynPrint(pasynUserSelf, ASYN_TRACE_FLOW,
               "%s:%s: end of image readout\n",
               driverName, functionName);
@@ -694,11 +736,21 @@ asynStatus PSL::startAcquire()
     int numImages=1;
 
     getIntegerParam(ADImageMode, &imageMode);
+
+    writeReadServer("Arm");
+
+    while (1)
+    {
+        writeReadServer("IsArmed");
+        if (strcmp(fromServer_, "True") == 0) break;
+    }
+
     switch (imageMode)
     {
     case ADImageSingle:
         writeReadServer("SetFrameNumber;1");
-        writeReadServer("Snap");
+        //writeReadServer("Snap");
+        writeReadServer("Acquire");
         break;
 
     case ADImageMultiple:
@@ -727,9 +779,11 @@ void PSL::PSLTask()
     int autoSave;
     int arrayCallbacks;
     int shutterMode;
+    //int lastFrame;
+    //int currentFrame=0;
     const char *functionName = "PSLTask";
 
-    //this->lock();
+    this->lock();
 
     /* Loop forever */
     while (1)
@@ -743,11 +797,11 @@ void PSL::PSLTask()
             setStringParam(ADStatusMessage, "Waiting for acquire command");
             callParamCallbacks();
             /* Release the lock while we wait for an event that says acquire has started, then lock again */
-            //this->unlock();
+            this->unlock();
             asynPrint(this->pasynUserSelf, ASYN_TRACE_FLOW,
                       "%s:%s: waiting for acquire to start\n", driverName, functionName);
             epicsEventWait(startEventId_);
-            //this->lock();
+            this->lock();
             getIntegerParam(ADAcquire, &acquire);
             setIntegerParam(ADNumImagesCounter, 0);
             callParamCallbacks();
@@ -762,14 +816,22 @@ void PSL::PSLTask()
         /* If arrayCallbacks is set then read the data, do callbacks */
         if (arrayCallbacks)
         {
+            //writeReadServer("GetFrameCount");
+            //sscanf(fromServer_, "%i", &lastFrame);
+            //cout << "lastFrame " << lastFrame << "\n";
+            //while (lastFrame > currentFrame)
             while (1)
             {
+                //writeReadServer("WaitForImage");
                 epicsThreadSleep(waitForExposure_);
+                //writeReadServer("GetFrameCount");
+                //sscanf(fromServer_, "%i", &currentFrame);
+                //cout << "currentFrame " << currentFrame << "\n";
                 writeReadServer("HasNewData");
                 if (strcmp(fromServer_, "True") == 0) break;
-                if (epicsEventTryWait(stopEventId_) == epicsEventWaitOK) break;
+                //if (epicsEventTryWait(stopEventId_) == epicsEventWaitOK) break;
                 //unlock();
-                epicsThreadSleep(epicsThreadSleepQuantum());
+                //epicsThreadSleep(epicsThreadSleepQuantum());
                 //lock();
             }
             getImage();
